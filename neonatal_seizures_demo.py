@@ -1,9 +1,8 @@
 """
-Helsinki Neonatal EEG
-
-Note for Colab:
-MEMORY EFFICIENT VERSION
+Helsinki Neonatal EEG - MEMORY EFFICIENT VERSION
 Loads data on-the-fly instead of storing all in RAM
+
+Key changes:
 1. Store only file paths and window indices, not actual data
 2. Load windows on-demand in __getitem__
 3. Process fewer files or smaller windows if needed
@@ -32,9 +31,9 @@ BATCH_SIZE = 32  # Increased from 16 for faster batching
 HIDDEN_SIZE = 48  # Reduced from 64 for faster computation
 NUM_COMPARTMENTS = 4  # 48/4 = 12
 WINDOW_SIZE = 3  # Reduced from 4 seconds
-OVERLAP = 0.5  # Keep at 0.5
-FIRST_N_TIMEPOINTS = 3000  # Reduced from 5000
-MAX_FILES_PER_FOLD = 15  # Reduced from 20
+OVERLAP = 0.75  # Increased from 0.5 to get MORE windows
+FIRST_N_TIMEPOINTS = 5000  # Increased from 3000 to get MORE data
+MAX_FILES_PER_FOLD = 20  # Increased from 15 to get MORE files
 CHECKPOINT_EVERY = 5  # Save every 5 epochs
 CHECKPOINT_DIR = "/content/drive/MyDrive/checkpoints"  # Save to Drive
 
@@ -42,7 +41,7 @@ print(f"Device: {DEVICE}")
 print(f"FAST MODE WITH CHECKPOINTING:")
 print(f"  Epochs: {NUM_EPOCHS}, Batch: {BATCH_SIZE}")
 print(f"  Hidden: {HIDDEN_SIZE}, Compartments: {NUM_COMPARTMENTS}")
-print(f"  Window: {WINDOW_SIZE}s, First {FIRST_N_TIMEPOINTS} points")
+print(f"  Window: {WINDOW_SIZE}s, Overlap: {OVERLAP}, First {FIRST_N_TIMEPOINTS} points")
 print(f"  Max files: {MAX_FILES_PER_FOLD}")
 print(f"  Checkpoints: every {CHECKPOINT_EVERY} epochs → {CHECKPOINT_DIR}")
 
@@ -51,7 +50,7 @@ Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
 
 
 # ============================
-# Model Definitions  
+# Model Definitions (same as before)
 # ============================
 
 class DIRUCell(nn.Module):
@@ -261,13 +260,18 @@ class HelsinkiNeonatalDatasetMemoryEfficient(Dataset):
             files_processed += 1
         
         print(f"Processed: {files_processed} files, Skipped: {files_skipped} corrupted files")
+        print(f"Raw windows before balancing: {len(window_index)}")
         
-        # Balance training set
+        # Balance training set ONLY
         if self.fold == 'train':
             seizure_windows = [w for w in window_index if w['label'] == 1]
             non_seizure_windows = [w for w in window_index if w['label'] == 0]
             
+            print(f"Train set - Before balancing:")
+            print(f"  Seizure: {len(seizure_windows)}, Non-seizure: {len(non_seizure_windows)}")
+            
             if len(seizure_windows) > 0:
+                # Keep 4:1 ratio for training
                 max_non_seizure = min(len(seizure_windows) * 4, len(non_seizure_windows))
                 non_seizure_windows = np.random.choice(
                     non_seizure_windows, size=max_non_seizure, replace=False
@@ -275,6 +279,16 @@ class HelsinkiNeonatalDatasetMemoryEfficient(Dataset):
             
             window_index = seizure_windows + non_seizure_windows
             np.random.shuffle(window_index)
+            
+            print(f"Train set - After balancing:")
+            print(f"  Seizure: {len(seizure_windows)}, Non-seizure: {len(non_seizure_windows)}")
+            print(f"  Total: {len(window_index)}")
+        else:
+            # Validation/Test: Keep ALL windows for proper evaluation
+            seizure_count = sum(1 for w in window_index if w['label'] == 1)
+            print(f"{self.fold.upper()} set - Keeping all windows:")
+            print(f"  Seizure: {seizure_count}, Non-seizure: {len(window_index) - seizure_count}")
+            print(f"  Total: {len(window_index)}")
         
         return window_index
     
@@ -395,8 +409,49 @@ def train_model(model, train_loader, val_loader, criterion, num_epochs=20, devic
     
     # Try to resume from checkpoint
     checkpoint_path = Path(checkpoint_dir) / f"{model_name}_checkpoint.pkl"
+    best_model_path = Path(checkpoint_dir) / f"{model_name}_best.pkl"
     
-    if checkpoint_path.exists():
+    # Prefer best model if both exist and checkpoint suggests overfitting
+    if checkpoint_path.exists() and best_model_path.exists():
+        print(f"  Found both checkpoint and best model")
+        try:
+            with open(checkpoint_path, 'rb') as f:
+                checkpoint = pickle.load(f)
+            with open(best_model_path, 'rb') as f:
+                best_checkpoint = pickle.load(f)
+            
+            # If checkpoint is overfitting (val_loss worse than best), use best model
+            checkpoint_epoch = checkpoint['epoch']
+            best_epoch = best_checkpoint['epoch']
+            
+            if checkpoint['best_val_loss'] < best_checkpoint['val_loss'] * 1.05:
+                # Checkpoint is still good, resume from it
+                model.load_state_dict(checkpoint['model_state'])
+                optimizer.load_state_dict(checkpoint['optimizer_state'])
+                history = checkpoint['history']
+                start_epoch = checkpoint_epoch + 1
+                epoch = start_epoch
+                best_val_loss = checkpoint['best_val_loss']
+                patience_counter = checkpoint.get('patience_counter', 0)
+                print(f"  Resumed from checkpoint at epoch {start_epoch}")
+            else:
+                # Checkpoint is overfitting, resume from best model but continue training
+                model.load_state_dict(best_checkpoint['model_state'])
+                # Don't load optimizer state - fresh start from best model
+                history = checkpoint['history']  # Keep history
+                start_epoch = best_epoch + 1
+                epoch = start_epoch
+                best_val_loss = best_checkpoint['val_loss']
+                patience_counter = checkpoint_epoch - best_epoch  # Calculate patience from gap
+                print(f"  ⚠ Checkpoint (epoch {checkpoint_epoch}) is overfitting")
+                print(f"  Loaded best model from epoch {best_epoch+1}, continuing training")
+                
+        except Exception as e:
+            print(f"  Error loading checkpoints: {e}")
+            print(f"  Starting from scratch")
+            start_epoch = 0
+            epoch = 0
+    elif checkpoint_path.exists():
         print(f"  Found checkpoint! Resuming from {checkpoint_path}")
         try:
             with open(checkpoint_path, 'rb') as f:
@@ -405,7 +460,7 @@ def train_model(model, train_loader, val_loader, criterion, num_epochs=20, devic
             optimizer.load_state_dict(checkpoint['optimizer_state'])
             history = checkpoint['history']
             start_epoch = checkpoint['epoch'] + 1
-            epoch = start_epoch  # Update epoch too
+            epoch = start_epoch
             best_val_loss = checkpoint['best_val_loss']
             patience_counter = checkpoint.get('patience_counter', 0)
             print(f"  Resumed from epoch {start_epoch}")
@@ -536,18 +591,33 @@ def evaluate_model(model, val_loader, device):
             all_probs.extend(probs)
             all_labels.extend(labels)
     
+    # Diagnostics
+    print(f"  Total samples: {len(all_labels)}")
+    print(f"  Positive samples: {sum(all_labels)} ({sum(all_labels)/len(all_labels)*100:.1f}%)")
+    print(f"  Prediction stats:")
+    print(f"    Min prob: {min(all_probs):.3f}, Max prob: {max(all_probs):.3f}")
+    print(f"    Mean prob: {np.mean(all_probs):.3f}, Median prob: {np.median(all_probs):.3f}")
+    
     if len(set(all_labels)) < 2:
+        print(f"  ⚠ WARNING: Only one class present!")
         return {'auc': 0.0, 'accuracy': 0.0, 'sensitivity': 0.0, 'specificity': 0.0}
     
     preds = (np.array(all_probs) > 0.5).astype(int)
+    print(f"    Predictions: {sum(preds)} positive, {len(preds)-sum(preds)} negative")
+    
     tn, fp, fn, tp = confusion_matrix(all_labels, preds).ravel()
+    
+    print(f"  Confusion Matrix:")
+    print(f"    True Positives: {tp}, False Positives: {fp}")
+    print(f"    False Negatives: {fn}, True Negatives: {tn}")
     
     return {
         'accuracy': accuracy_score(all_labels, preds),
         'sensitivity': tp / (tp + fn) if (tp + fn) > 0 else 0,
         'specificity': tn / (tn + fp) if (tn + fp) > 0 else 0,
         'auc': roc_auc_score(all_labels, all_probs),
-        'f1': f1_score(all_labels, preds)
+        'f1': f1_score(all_labels, preds),
+        'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn
     }
 
 
