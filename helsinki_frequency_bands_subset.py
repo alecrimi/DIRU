@@ -1,181 +1,353 @@
 """
-Helsinki Neonatal EEG - Raw Time Series with Subband Decomposition
+Helsinki Neonatal EEG - Band Power Spectrum Features  (v6 - LOO-CV)
 
-Instead of reducing to power scalars, we decompose the signal into frequency bands
-keeping the full time series. Each band becomes additional channels:
-- Delta (0.5-4 Hz): 21 channels
-- Theta (4-8 Hz): 21 channels
-- Alpha (8-13 Hz): 21 channels
-- Beta (13-30 Hz): 21 channels
-- Gamma (30-50 Hz): 21 channels
-Total: 105 channels → RNN
+Changes vs v5
+─────────────
+1. Leave-One-Out CV: features pre-computed once for all 79 recordings,
+   z-score re-fitted inside each fold on the 78 training recordings.
 
-Each DIRU compartment can specialize to one frequency band!
+2. DIRU fix: each compartment now receives the FULL 40-feature input
+   with its own dedicated W_in weights — same input as LSTM/Tractable.
+   The inductive bias is the K separate learned projections, not input
+   restriction. Hidden size unchanged (32) — fair comparison.
 """
 
 import numpy as np
 import pandas as pd
+import torch"""
+Nigeria / Guinea-Bissau EEG — Control vs Epileptic Classification  (v1)
+
+Data format
+───────────
+  - Gzipped CSV files (NOT EDF): EEGs_Guinea-Bissau/signal-{id}.csv.gz
+                                  EEGs_Nigeria/signal-{session}.csv.gz
+  - First column: sample index (discarded)
+  - Columns 1–14: 14 EEG channels @ 128 Hz
+  - Metadata CSV: subject.id, Group (Epilepsy/Control), Eyes.condition,
+                  recordedPeriod, ...
+
+Data selection (matching notebook logic)
+─────────────────────────────────────────
+  Only closed-eyes data is used (50% of rows, first or last half depending
+  on Eyes.condition first word).  This matches load_eeg_from_gz() in the
+  original notebook.
+
+Feature pipeline (identical to Helsinki v6)
+────────────────────────────────────────────
+  Raw signal (14 ch, 128 Hz)
+    → bandpass 1–40  Hz + bipolar referencing + per-channel z-score
+    → 5 subbands → sliding 0.5s frame → mean(x²) → log1p
+    → (T_seq=11, 70)   [14 ch × 5 bands]
+    → z-score per LOO fold
+
+LOO-CV: leave one SUBJECT out per fold.
+Label: 0 = Control, 1 = Epilepsy (subject-level, repeated across windows).
+"""
+
+import gzip
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from scipy.signal import butter, filtfilt, resample
-from sklearn.metrics import (confusion_matrix, roc_auc_score, roc_curve,
-                            f1_score, precision_score, accuracy_score)
+from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve, accuracy_score
 import matplotlib.pyplot as plt
 from pathlib import Path
-import pyedflib
 import gc
 import pickle
 from tqdm import tqdm
 
-# ============================
-# Global config
-# ============================
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-NUM_EPOCHS = 20
-BATCH_SIZE = 32
-HIDDEN_SIZE = 60
-NUM_COMPARTMENTS = 5  # One per frequency band!
-WINDOW_SIZE = 3       # seconds
-OVERLAP = 0.5
-FIRST_N_TIMEPOINTS = 3000
-MAX_FILES_PER_FOLD = 15
+# ============================================================
+# Config
+# ============================================================
+DATASET_DIR    = "/content/drive_mount/.shortcut-targets-by-id/1NtgDtnXESKUfllHY7gxV__B9Cb9Eciaz/DATASET" #"/content/drive/MyDrive/DATASET"   # folder with CSV and EEG subdirs
+METADATA_CSV   = "metadata_guineabissau.csv"         # relative to DATASET_DIR
+EEG_SUBDIR     = "EEGs_Guinea-Bissau"                # subfolder with .csv.gz files
+FILE_PATTERN   = "signal-{subject_id}.csv.gz"        # {subject_id} = subject.id column
+
+# For Nigeria, change to:
+# METADATA_CSV  = "metadata_nigeria.csv"
+# EEG_SUBDIR    = "EEGs_Nigeria"
+# FILE_PATTERN  = "signal-{csv_file}"   # nigeria uses session-based filenames in csv.file col
+# Nigeria also needs: FILE_COL = "csv.file"  (already contains path fragment)
+
 CHECKPOINT_DIR = "/content/drive/MyDrive/checkpoints"
+FEATURE_CACHE  = "/content/drive/MyDrive/checkpoints/guinea_features_v1.pkl"
 
-#  DIRU SPECIFIC
-DIRU_HIDDEN_SIZE = 20
-DIRU_NUM_COMPARTMENTS = 5
-DIRU_DROPOUT = 0.5
+# Signal
+SOURCE_FS    = 128        # sampling frequency of the recordings
+TARGET_FS    = 128        # keep as-is (no resample needed)
+N_CHANNELS   = 14        # columns 1–14 of each CSV
+EEG_COL_SLICE = slice(1, 15)   # iloc[:, 1:15] — skip index column
 
-# Frequency bands for neonatal EEG
-FREQUENCY_BANDS = {
-    'delta': (0.5, 4),    # Slow-wave, burst suppression
-    'theta': (4, 8),      # Neonatal baseline rhythm
-    'alpha': (8, 13),     # Less prominent in neonates
-    'beta':  (13, 30),    # Seizure markers, muscle artifact
-    'gamma': (30, 50)     # High-frequency oscillations
-}
+# Closed-eyes extraction (matching notebook: 50% of rows)
+CLOSED_EYES_PERC = 0.5
 
-print(f"Device: {DEVICE}")
-print(f"SUBBAND DECOMPOSITION (Raw Time Series):")
-print(f"  Bands: {list(FREQUENCY_BANDS.keys())}")
-print(f"  Compartments: {NUM_COMPARTMENTS} (one per band)")
-print(f"  Epochs: {NUM_EPOCHS}, Batch: {BATCH_SIZE}, Hidden: {HIDDEN_SIZE}")
-print(f"  Window: {WINDOW_SIZE}s, Overlap: {OVERLAP}")
-print(f"  First {FIRST_N_TIMEPOINTS} timepoints, Max files: {MAX_FILES_PER_FOLD}")
+# Window / feature
+WINDOW_SIZE    = 3        # seconds
+OVERLAP        = 0.75
+FRAME_LEN_SEC  = 0.5
+FRAME_STEP_SEC = 0.25
 
+SUBBANDS = [
+    ("delta", 0.5,  4.0),
+    ("theta", 4.0,  8.0),
+    ("alpha", 8.0,  13.0),
+    ("beta",  13.0, 30.0),
+    ("gamma", 30.0, 45.0),
+]
+N_BANDS         = len(SUBBANDS)
+FULL_INPUT_SIZE = N_BANDS * N_CHANNELS   # 70
+
+# Model
+DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
+HIDDEN_SIZE    = 32
+N_COMPARTMENTS = 4
+DIRU_DROPOUT   = 0.5
+NUM_EPOCHS     = 40
+BATCH_SIZE     = 32
+
+# Derived
+_FL       = int(FRAME_LEN_SEC  * TARGET_FS)
+_FS_STEP  = int(FRAME_STEP_SEC * TARGET_FS)
+_WIN_SAMP = int(WINDOW_SIZE    * TARGET_FS)
+T_SEQ     = 1 + (_WIN_SAMP - _FL) // _FS_STEP   # 11
+
+print(f"Device={DEVICE}  T_seq={T_SEQ}  features={FULL_INPUT_SIZE}")
+print(f"hidden={HIDDEN_SIZE} (all models)  epochs={NUM_EPOCHS}  batch={BATCH_SIZE}")
 Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
 
 
-# ============================
-# Subband Decomposition
-# ============================
+# ============================================================
+# Data loading
+# ============================================================
 
-def decompose_into_subbands(data, fs=256, bands=FREQUENCY_BANDS):
+def load_closed_eyes(file_path, first_condition, file_rows_count=None):
     """
-    Filter signal into each frequency band keeping full time series.
+    Load the closed-eyes portion of a .csv.gz EEG file.
+    Returns (14, n_samples) numpy array or None on error.
 
-    Input:  (channels, samples) e.g. (21, 768)
-    Output: (channels × bands, samples) e.g. (105, 768)
-
-    Each DIRU compartment can specialize to one frequency band:
-        Channels   0- 20: delta-filtered EEG (0.5-4 Hz)
-        Channels  21- 41: theta-filtered EEG (4-8 Hz)
-        Channels  42- 62: alpha-filtered EEG (8-13 Hz)
-        Channels  63- 83: beta-filtered EEG  (13-30 Hz)
-        Channels  84-104: gamma-filtered EEG (30-50 Hz)
+    first_condition : "closed" → use first 50% of rows
+                      "open"   → use last 50% of rows
     """
-    band_signals = []
+    try:
+        perc = CLOSED_EYES_PERC
 
-    for band_name, (low, high) in bands.items():
-        b, a = butter(4, [low, high], fs=fs, btype='band')
-        band_data = filtfilt(b, a, data, axis=1)  # (channels, samples)
-        band_signals.append(band_data)
+        with gzip.open(file_path, 'rt') as f:
+            if file_rows_count is not None:
+                rows_to_read = int(file_rows_count * perc)
+                if first_condition == "closed":
+                    df = pd.read_csv(f, nrows=rows_to_read, on_bad_lines='skip')
+                else:  # "open" — skip first half
+                    skip_rows = file_rows_count - rows_to_read
+                    df = pd.read_csv(f, skiprows=range(1, skip_rows + 1),
+                                     on_bad_lines='skip')
+            else:
+                # No row count available: load all, then slice
+                df = pd.read_csv(f, on_bad_lines='skip')
+                rows_to_read = int(len(df) * perc)
+                if first_condition == "closed":
+                    df = df.iloc[:rows_to_read]
+                else:
+                    df = df.iloc[-rows_to_read:]
 
-    # Stack all bands along channel dimension
-    decomposed = np.vstack(band_signals)  # (channels × bands, samples)
+    except Exception as e:
+        print(f"  ERROR loading {Path(file_path).name}: {e}")
+        return None
 
-    return decomposed
+    try:
+        eeg = df.iloc[:, EEG_COL_SLICE].values.T.astype(np.float32)  # (14, T)
+        if eeg.shape[0] != N_CHANNELS:
+            print(f"  WARNING: {Path(file_path).name} has {eeg.shape[0]} ch, expected {N_CHANNELS}")
+            return None
+    except Exception as e:
+        print(f"  ERROR extracting channels from {Path(file_path).name}: {e}")
+        return None
+
+    return eeg
 
 
-# ============================
-# Model Definitions
-# ============================
+def preprocess(data):
+    """
+    (14, n_samples) raw EEG → (14, n_samples) preprocessed.
+    Bandpass 1–45 Hz, notch 49–51 Hz, CAR, per-channel z-score.
+    """
+    fs = TARGET_FS
+    try:
+        b, a     = butter(4, [1.0, 45.0], fs=fs, btype='band')
+        data     = filtfilt(b, a, data, axis=1)
+        b_n, a_n = butter(4, [49, 51],   fs=fs, btype='bandstop')
+        data     = filtfilt(b_n, a_n, data, axis=1)
+        data    -= data.mean(axis=0, keepdims=True)                 # CAR
+        data     = (data - data.mean(axis=1, keepdims=True)) / \
+                   (data.std(axis=1, keepdims=True) + 1e-8)         # per-ch z-score
+    except Exception as e:
+        print(f"  ERROR in preprocess: {e}")
+        return None
+    return data
+
+
+# ============================================================
+# Band-power feature extraction
+# ============================================================
+
+def _bp(data, lo, hi, fs, order=4):
+    nyq = fs / 2.0
+    b, a = butter(order, [max(lo/nyq, 1e-4), min(hi/nyq, 1-1e-4)], btype='band')
+    return filtfilt(b, a, data, axis=1)
+
+
+def compute_band_power_sequence(data):
+    """(N_CHANNELS, n_samp) -> (T_seq, N_BANDS*N_CHANNELS)  log band-power."""
+    n_ch, n_samp = data.shape
+    starts   = np.arange(0, n_samp - _FL + 1, _FS_STEP)
+    n_frames = len(starts)
+    power    = np.zeros((N_BANDS, n_ch, n_frames), dtype=np.float32)
+    for b_i, (_, lo, hi) in enumerate(SUBBANDS):
+        band = _bp(data, lo, hi, TARGET_FS)
+        for f_i, s in enumerate(starts):
+            power[b_i, :, f_i] = np.mean(band[:, s:s+_FL] ** 2, axis=1)
+    power = np.log1p(power)
+    power = power.transpose(2, 0, 1)     # (T, B, C)
+    return power.reshape(n_frames, N_BANDS * n_ch).astype(np.float32)
+
+
+# ============================================================
+# Pre-compute all features once
+# ============================================================
+
+def build_all_features(dataset_dir):
+    """
+    Reads metadata CSV, loads each subject's closed-eyes EEG,
+    extracts band-power windows.
+
+    Returns list of dicts:
+      { 'subject_id', 'subject_label': 0/1,
+        'X': (n_win, T_seq, 70), 'y': (n_win,) }
+    """
+    cache = Path(FEATURE_CACHE)
+    if cache.exists():
+        print(f"Loading cached features: {cache}")
+        recs = pickle.load(open(cache, 'rb'))
+        print(f"  {len(recs)} subjects  "
+              f"(ctrl={sum(r['subject_label']==0 for r in recs)}, "
+              f"epi={sum(r['subject_label']==1 for r in recs)})")
+        return recs
+
+    dataset_dir = Path(dataset_dir)
+    meta = pd.read_csv(dataset_dir / METADATA_CSV)
+
+    # Derive first_condition from Eyes.condition
+    meta['first_condition'] = meta['Eyes.condition'].str.split('-').str[0]
+
+    # Build file paths
+    meta['file_path'] = meta['subject.id'].apply(
+        lambda sid: str(dataset_dir / EEG_SUBDIR /
+                        FILE_PATTERN.format(subject_id=sid)))
+
+    # Binary label
+    meta['label'] = (meta['Group'].str.strip().str.lower() == 'epilepsy').astype(int)
+
+    win_samp  = _WIN_SAMP
+    step_samp = max(1, int(win_samp * (1 - OVERLAP)))
+    recs      = []
+
+    for _, row in tqdm(meta.iterrows(), total=len(meta),
+                       desc="Pre-computing features"):
+        fp = row['file_path']
+        if not Path(fp).exists():
+            print(f"  MISSING: {Path(fp).name}")
+            continue
+
+        # row count if available (speeds up loading)
+        row_count = int(row['recordedPeriod'] * SOURCE_FS) \
+                    if 'recordedPeriod' in row else None
+
+        raw = load_closed_eyes(fp, row['first_condition'], row_count)
+        if raw is None:
+            continue
+
+        data = preprocess(raw)
+        if data is None:
+            continue
+
+        n_samp = data.shape[1]
+        X_list = []
+        for start in range(0, n_samp - win_samp, step_samp):
+            window = data[:, start:start+win_samp]
+            ps = compute_band_power_sequence(window)
+            ps = ps[:T_SEQ] if ps.shape[0] >= T_SEQ else \
+                 np.vstack([ps, np.zeros((T_SEQ - ps.shape[0], FULL_INPUT_SIZE))])
+            X_list.append(ps)
+
+        if not X_list:
+            continue
+
+        X = np.stack(X_list).astype(np.float32)
+        y = np.full(len(X_list), float(row['label']), dtype=np.float32)
+
+        recs.append({
+            'subject_id':    row['subject.id'],
+            'subject_label': int(row['label']),
+            'X': X, 'y': y,
+        })
+
+    n_ctrl = sum(1 for r in recs if r['subject_label'] == 0)
+    n_epi  = sum(1 for r in recs if r['subject_label'] == 1)
+    print(f"\nDone: {len(recs)} subjects  ({n_ctrl} control, {n_epi} epilepsy)")
+    pickle.dump(recs, open(cache, 'wb'))
+    print(f"Cached: {cache}")
+    return recs
+
+
+# ============================================================
+# Models — identical to Helsinki v6
+# ============================================================
 
 class DIRUCell(nn.Module):
-    def __init__(self, input_size, hidden_size, num_compartments=5):
+    def __init__(self, input_size, hidden_size, num_compartments):
         super().__init__()
-        self.hidden_size = hidden_size
         self.num_comp = num_compartments
-
-        # input_size should be divisible by num_compartments
-        assert input_size % num_compartments == 0
-        self.band_size = input_size // num_compartments  # 105 // 5 = 21
-
-        # Each compartment has its own W_in seeing only its band's channels
-        self.W_in = nn.ModuleList([
-            nn.Linear(self.band_size, hidden_size) for _ in range(num_compartments)
+        self.W_in  = nn.ModuleList([
+            nn.Linear(input_size, hidden_size) for _ in range(num_compartments)
         ])
-        # W_rec still sees full hidden state
-        self.W_rec = nn.ModuleList([
-            nn.Linear(hidden_size, hidden_size) for _ in range(num_compartments)
-        ])
-        # Gate still sees all compartments combined
-        self.gate = nn.Linear(hidden_size * num_compartments, hidden_size)
+        self.W_rec = nn.Linear(hidden_size, hidden_size * num_compartments)
+        self.gate  = nn.Linear(hidden_size * num_compartments, num_compartments)
 
     def forward(self, x, h):
-        # x shape: (batch, input_size) e.g. (32, 105)
-        # Split x into band-specific chunks
-        # x_bands[0] = delta channels (0-20)
-        # x_bands[1] = theta channels (21-41) etc.
-        x_bands = torch.chunk(x, self.num_comp, dim=1)  # 5 × (batch, 21)
-
-        # Each compartment processes its own band
-        comp_outputs = []
-        for i in range(self.num_comp):
-            local_out = torch.tanh(self.W_in[i](x_bands[i]) + self.W_rec[i](h))
-            comp_outputs.append(local_out)
-
-        # Stack for gating
-        comp = torch.stack(comp_outputs, dim=1)  # (batch, num_comp, hidden_size)
-        comp_flat = comp.view(comp.size(0), -1)  # (batch, num_comp * hidden_size)
-
-        # Active gate - KEY difference from Tractable
-        g = torch.sigmoid(self.gate(comp_flat))  # (batch, hidden_size)
-
-        # Gated summation - KEY difference from Tractable
-        h_new = torch.sum(comp, dim=1) * g  # (batch, hidden_size)
-
-        return h_new
+        rec   = self.W_rec(h).chunk(self.num_comp, dim=1)
+        outs  = [torch.tanh(self.W_in[i](x) + rec[i]) for i in range(self.num_comp)]
+        stack = torch.stack(outs, dim=1)
+        w     = torch.softmax(self.gate(stack.reshape(stack.size(0), -1)), dim=1)
+        return (stack * w.unsqueeze(2)).sum(dim=1)
 
 
 class DIRU(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_compartments=5, dropout=0.3):
+    def __init__(self, input_size, hidden_size, output_size,
+                 num_compartments=N_COMPARTMENTS, dropout=DIRU_DROPOUT):
         super().__init__()
         self.hidden_size = hidden_size
-        self.cell = DIRUCell(input_size, hidden_size, num_compartments)
-        self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_size, output_size)
+        self.cell        = DIRUCell(input_size, hidden_size, num_compartments)
+        self.dropout     = nn.Dropout(dropout)
+        self.fc          = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
         B, T, _ = x.shape
         h = torch.zeros(B, self.hidden_size, device=x.device)
         for t in range(T):
             h = self.cell(x[:, t], h)
-        h = self.dropout(h)
-        return self.fc(h)
+        return self.fc(self.dropout(h))
 
 
 class TractableDendriticCell(nn.Module):
-    def __init__(self, input_size, hidden_size, num_compartments=5):
+    def __init__(self, input_size, hidden_size, num_compartments):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_comp = num_compartments
+        self.num_comp  = num_compartments
         self.comp_size = hidden_size // num_compartments
         assert hidden_size % num_compartments == 0
-
-        self.W_in = nn.ModuleList([
-            nn.Linear(input_size, self.comp_size) for _ in range(num_compartments)
+        self.W_in  = nn.ModuleList([
+            nn.Linear(input_size,  self.comp_size) for _ in range(num_compartments)
         ])
         self.W_rec = nn.ModuleList([
             nn.Linear(hidden_size, self.comp_size) for _ in range(num_compartments)
@@ -183,710 +355,807 @@ class TractableDendriticCell(nn.Module):
         self.integration = nn.Linear(hidden_size, hidden_size)
 
     def forward(self, x, h):
-        comp_outputs = []
-        for i in range(self.num_comp):
-            local_out = torch.tanh(self.W_in[i](x) + self.W_rec[i](h))
-            comp_outputs.append(local_out)
-        combined = torch.cat(comp_outputs, dim=1)
-        h_new = torch.tanh(self.integration(combined))
-        return h_new
+        outs = [torch.tanh(self.W_in[i](x) + self.W_rec[i](h))
+                for i in range(self.num_comp)]
+        return torch.tanh(self.integration(torch.cat(outs, dim=1)))
 
 
 class TractableDendriticRNN(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_compartments=5):
+    def __init__(self, input_size, hidden_size, output_size,
+                 num_compartments=N_COMPARTMENTS):
         super().__init__()
         self.hidden_size = hidden_size
-        self.cell = TractableDendriticCell(input_size, hidden_size, num_compartments)
-        self.dropout = nn.Dropout(0.3)
-        self.fc = nn.Linear(hidden_size, output_size)
+        self.cell        = TractableDendriticCell(input_size, hidden_size, num_compartments)
+        self.dropout     = nn.Dropout(0.5)
+        self.fc          = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
         B, T, _ = x.shape
         h = torch.zeros(B, self.hidden_size, device=x.device)
         for t in range(T):
             h = self.cell(x[:, t], h)
-        h = self.dropout(h)
-        return self.fc(h)
+        return self.fc(self.dropout(h))
 
 
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_layers=1):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers,
-                           batch_first=True, dropout=0.3 if num_layers > 1 else 0)
-        self.dropout = nn.Dropout(0.3)
-        self.fc = nn.Linear(hidden_size, output_size)
+        self.lstm    = nn.LSTM(input_size, hidden_size, num_layers=num_layers,
+                               batch_first=True)
+        self.dropout = nn.Dropout(0.5)
+        self.fc      = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
         out, _ = self.lstm(x)
-        h = out[:, -1]
-        h = self.dropout(h)
-        return self.fc(h)
+        return self.fc(self.dropout(out[:, -1]))
 
 
-# ============================
-# Memory Efficient Dataset with Subband Decomposition
-# ============================
+def make_models():
+    return {
+        'diru':      DIRU(FULL_INPUT_SIZE, HIDDEN_SIZE, 1).to(DEVICE),
+        'tractable': TractableDendriticRNN(FULL_INPUT_SIZE, HIDDEN_SIZE, 1).to(DEVICE),
+        'lstm':      LSTMModel(FULL_INPUT_SIZE, HIDDEN_SIZE, 1).to(DEVICE),
+    }
 
-class HelsinkiSubbandDataset(Dataset):
-    """
-    Memory-efficient dataset with subband decomposition.
-    Stores only metadata, loads and decomposes data on-demand.
-    Input to RNN: (samples, channels×bands) e.g. (768, 105)
-    """
 
-    def __init__(self, data_path, annotations_path, window_size=3, overlap=0.5,
-                 fold='train', first_n_timepoints=3000, max_files=15):
-        self.data_path = Path(data_path)
-        self.annotations_path = Path(annotations_path)
-        self.window_size = window_size
-        self.overlap = overlap
-        self.fold = fold
-        self.first_n = first_n_timepoints
-        self.fs = 256
-        self.max_files = max_files
+# ============================================================
+# Per-fold training (identical to Helsinki v6)
+# ============================================================
 
-        if not self.data_path.exists():
-            raise FileNotFoundError(f"Data path not found: {data_path}")
-        if not self.annotations_path.exists():
-            raise FileNotFoundError(f"Annotations not found: {annotations_path}")
+def train_fold(model, X_tr, y_tr, X_val, y_val):
+    tr_ds     = TensorDataset(torch.FloatTensor(X_tr),
+                               torch.FloatTensor(y_tr).unsqueeze(1))
+    tr_loader = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True)
 
-        print(f"\nLoading annotations from {annotations_path}...")
-        self.annotations_df = pd.read_csv(annotations_path, header=None)
-        print(f"✓ Annotations shape: {self.annotations_df.shape}")
+    n_pos = int(y_tr.sum())
+    n_neg = len(y_tr) - n_pos
+    pw    = torch.FloatTensor([n_neg / max(n_pos, 1)]).to(DEVICE)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
 
-        self.window_index = self._build_window_index()
+    optimizer     = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    warmup_sched  = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0, total_iters=3)
+    plateau_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=4, min_lr=1e-5)
 
-        print(f"\n{fold.upper()} SET:")
-        print(f"Total windows: {len(self.window_index)}")
-        if len(self.window_index) > 0:
-            seizure_count = sum(1 for w in self.window_index if w['label'] == 1)
-            print(f"Seizure windows: {seizure_count}")
-            print(f"Non-seizure windows: {len(self.window_index) - seizure_count}")
-            print(f"Class ratio: {seizure_count / len(self.window_index) * 100:.1f}% seizure")
-
-    def _build_window_index(self):
-        window_index = []
-
-        edf_files = sorted(list(self.data_path.glob("eeg*.edf")),
-                          key=lambda x: int(''.join(filter(str.isdigit, x.stem))))
-
-        print(f"\nFound {len(edf_files)} EDF files")
-
-        n_total = min(len(edf_files), 79)  # 79 files
-        n_train = int(0.70 * n_total)      # 55 files for train
-        n_val = int(0.30 * n_total)        # 12 files for val
-        # test = remaining files           # 12 files for test (implicitly)
-
-        if self.fold == 'train':
-            edf_files = edf_files[:n_train]               # 0-54
-        elif self.fold == 'val':
-            edf_files = edf_files[n_train:n_train+n_val]  # 55-66
-        else:  # test
-            edf_files = edf_files[n_train+n_val:n_total]  # 67-78
-
-            print(f"Using {len(edf_files)} files for {self.fold} set")
-
-        window_samples = int(self.window_size * self.fs)
-        step_samples = int(window_samples * (1 - self.overlap))
-
-        files_processed = 0
-        files_skipped = 0
-
-        for idx, edf_file in enumerate(edf_files):
-            file_num = int(''.join(filter(str.isdigit, edf_file.stem)))
-            column_idx = file_num - 1
-
-            if column_idx >= self.annotations_df.shape[1]:
-                files_skipped += 1
-                continue
-
-            try:
-                test_edf = pyedflib.EdfReader(str(edf_file))
-                test_edf.close()
-            except Exception as e:
-                print(f"  Skipping corrupted file: {edf_file.name} ({e})")
-                files_skipped += 1
-                continue
-
-            annotations = self.annotations_df[column_idx].values[:self.first_n]
-
-            for start_idx in range(0, len(annotations) - window_samples, step_samples):
-                end_idx = start_idx + window_samples
-                window_annotations = annotations[start_idx:end_idx]
-                seizure_ratio = window_annotations.sum() / len(window_annotations)
-                label = 1 if seizure_ratio > 0.3 else 0
-
-                window_index.append({
-                    'file_path': str(edf_file),
-                    'start_idx': start_idx,
-                    'end_idx': end_idx,
-                    'label': label,
-                    'seizure_ratio': seizure_ratio
-                })
-
-            files_processed += 1
-
-        print(f"Processed: {files_processed} files, Skipped: {files_skipped} corrupted files")
-
-        # Balance training set
-        if self.fold == 'train':
-            seizure_windows = [w for w in window_index if w['label'] == 1]
-            non_seizure_windows = [w for w in window_index if w['label'] == 0]
-
-            print(f"Train set - Before balancing:")
-            print(f"  Seizure: {len(seizure_windows)}, Non-seizure: {len(non_seizure_windows)}")
-
-            if len(seizure_windows) > 0:
-                max_non_seizure = min(len(seizure_windows) * 4, len(non_seizure_windows))
-                non_seizure_windows = np.random.choice(
-                    non_seizure_windows, size=max_non_seizure, replace=False
-                ).tolist()
-
-            window_index = seizure_windows + non_seizure_windows
-            np.random.shuffle(window_index)
-
-            print(f"Train set - After balancing:")
-            print(f"  Seizure: {len(seizure_windows)}, Non-seizure: {len(non_seizure_windows)}")
-            print(f"  Total: {len(window_index)}")
-        else:
-            seizure_count = sum(1 for w in window_index if w['label'] == 1)
-            print(f"{self.fold.upper()} set - Keeping all windows:")
-            print(f"  Seizure: {seizure_count}, Non-seizure: {len(window_index) - seizure_count}")
-            print(f"  Total: {len(window_index)}")
-
-        return window_index
-
-    def _load_and_preprocess_file(self, file_path):
-        """Load, preprocess and decompose into subbands."""
-        if not hasattr(self, '_cache'):
-            self._cache = {}
-
-        if file_path in self._cache:
-            return self._cache[file_path]
-
-        # Load EDF
-        try:
-            edf = pyedflib.EdfReader(file_path)
-            n_channels = edf.signals_in_file
-            sample_freq = edf.getSampleFrequency(0)
-
-            data = []
-            for i in range(n_channels):
-                signal = edf.readSignal(i)
-                data.append(signal)
-            data = np.array(data)
-            edf.close()
-        except Exception as e:
-            print(f"  ERROR loading {Path(file_path).name}: {e}")
-            return None
-
-        # Preprocess
-        try:
-            if sample_freq != self.fs:
-                n_samples_new = int(data.shape[1] * self.fs / sample_freq)
-                data = resample(data, n_samples_new, axis=1)
-
-            # Bandpass filter
-            b, a = butter(4, [0.5, 50], fs=self.fs, btype='band')
-            data = filtfilt(b, a, data, axis=1)
-
-            # Notch filter
-            b_notch, a_notch = butter(4, [49, 51], fs=self.fs, btype='bandstop')
-            data = filtfilt(b_notch, a_notch, data, axis=1)
-
-            # Common average reference
-            data = data - data.mean(axis=0, keepdims=True)
-
-            # Normalize each channel
-            data = (data - data.mean(axis=1, keepdims=True)) / (data.std(axis=1, keepdims=True) + 1e-8)
-
-            # Truncate
-            data = data[:, :self.first_n]
-
-            # Decompose into subbands - KEY STEP
-            # (21 channels, samples) → (105 channels, samples)
-            data = decompose_into_subbands(data, fs=self.fs)
-
-        except Exception as e:
-            print(f"  ERROR preprocessing {Path(file_path).name}: {e}")
-            return None
-
-        # Cache (limit to 3 files)
-        if len(self._cache) > 3:
-            self._cache.pop(next(iter(self._cache)))
-
-        self._cache[file_path] = data
-        return data
-
-    def __len__(self):
-        return len(self.window_index)
-
-    def __getitem__(self, idx):
-        """Load window on-demand with subband decomposition."""
-        window_info = self.window_index[idx]
-
-        data = self._load_and_preprocess_file(window_info['file_path'])
-
-        # data is now (105 channels, samples)
-        n_channels = len(FREQUENCY_BANDS) * 21  # fallback for dummy
-
-        if data is None:
-            dummy_window = np.zeros((int(self.window_size * self.fs), n_channels))
-            return torch.FloatTensor(dummy_window), torch.FloatTensor([window_info['label']])
-
-        start = window_info['start_idx']
-        end = window_info['end_idx']
-
-        if end > data.shape[1]:
-            end = data.shape[1]
-            start = max(0, end - int(self.window_size * self.fs))
-
-        window = data[:, start:end].T  # (samples, 105 channels)
-
-        # Pad if needed
-        expected_length = int(self.window_size * self.fs)
-        if window.shape[0] < expected_length:
-            padding = np.zeros((expected_length - window.shape[0], window.shape[1]))
-            window = np.vstack([window, padding])
-
-        label = window_info['label']
-
-        return torch.FloatTensor(window), torch.FloatTensor([label])
-
-
-# ============================
-# Training
-# ============================
-
-def train_model(model, train_loader, val_loader, criterion, num_epochs=20, device='cpu',
-                model_name='model', checkpoint_dir='/content/drive/MyDrive/checkpoints',
-                skip_training=False):
-    """Training with checkpoint loading, progress bars, and final model saving."""
-
-    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-
-    model.to(device)
-
-    best_model_path = Path(checkpoint_dir) / f"{model_name}_best.pkl"
-    final_model_path = Path(checkpoint_dir) / f"{model_name}_final.pkl"
-
-    # If final model exists, load and skip training
-    if final_model_path.exists():
-        print(f"  ⚡ Found final model: {final_model_path.name}")
-        try:
-            with open(final_model_path, 'rb') as f:
-                final_checkpoint = pickle.load(f)
-
-            if isinstance(final_checkpoint, dict) and 'model_state' in final_checkpoint:
-                model.load_state_dict(final_checkpoint['model_state'])
-                epoch = final_checkpoint.get('epoch', '?')
-                val_loss = final_checkpoint.get('val_loss', float('inf'))
-                print(f"  ✓ Loaded final model from epoch {epoch+1}, val_loss: {val_loss:.4f}")
-            else:
-                model.load_state_dict(final_checkpoint)
-                print(f"  ✓ Loaded final model (legacy format)")
-
-            print(f"  ⏭ Skipping training!")
-            return {'train_loss': [], 'val_loss': []}
-        except Exception as e:
-            print(f"  ⚠ Error loading final model: {e}")
-            print(f"  Falling through to normal training...")
-
-    # Skip training mode - just load best and return
-    if skip_training:
-        if best_model_path.exists():
-            print(f"  ⚡ Skipping training - loading best model")
-            try:
-                with open(best_model_path, 'rb') as f:
-                    best_checkpoint = pickle.load(f)
-                model.load_state_dict(best_checkpoint['model_state'])
-                print(f"  ✓ Loaded from epoch {best_checkpoint['epoch']+1}, val_loss: {best_checkpoint['val_loss']:.4f}")
-                return {'train_loss': [], 'val_loss': []}
-            except Exception as e:
-                print(f"  ⚠ Error loading: {e}, training from scratch")
-        else:
-            print(f"  ⚠ Best model not found, training from scratch")
-
-    # Check if we should resume from best checkpoint
-    start_epoch = 0
     best_val_loss = float('inf')
+    best_state    = None
+    patience_ctr  = 0
 
-    if best_model_path.exists():
-        print(f"  Found existing checkpoint: {best_model_path.name}")
-        try:
-            with open(best_model_path, 'rb') as f:
-                checkpoint = pickle.load(f)
+    X_val_t = torch.FloatTensor(X_val).to(DEVICE)
+    y_val_t = torch.FloatTensor(y_val).unsqueeze(1).to(DEVICE)
 
-            if isinstance(checkpoint, dict):
-                if 'model_state' in checkpoint:
-                    model.load_state_dict(checkpoint['model_state'])
-                    start_epoch = checkpoint.get('epoch', 0) + 1
-                    best_val_loss = checkpoint.get('val_loss', float('inf'))
-                    print(f"  ✓ Resuming from epoch {start_epoch}, best val_loss: {best_val_loss:.4f}")
-                elif any(k.startswith(('cell.', 'fc.', 'lstm.', 'dropout.')) for k in checkpoint.keys()):
-                    model.load_state_dict(checkpoint)
-                    print(f"  ✓ Loaded old format checkpoint")
-                else:
-                    print(f"  ⚠ Unknown checkpoint format, starting fresh")
-            else:
-                model.load_state_dict(checkpoint)
-                print(f"  ✓ Loaded legacy format checkpoint")
-        except Exception as e:
-            print(f"  ⚠ Error loading checkpoint: {e}")
-            print(f"  Starting from scratch")
-            start_epoch = 0
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-
-    history = {'train_loss': [], 'val_loss': []}
-    patience = 7
-    patience_counter = 0
-    last_epoch = start_epoch
-    last_val_loss = float('inf')
-
-    print(f"  Starting training...")
-    print(f"  Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
-
-    for epoch in range(start_epoch, num_epochs):
+    for epoch in range(NUM_EPOCHS):
         model.train()
-        train_loss = 0
-
-        pbar = tqdm(train_loader, desc=f"    Training", leave=False, ncols=100)
-
-        for batch_x, batch_y in pbar:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-
+        for bx, by in tr_loader:
+            bx, by = bx.to(DEVICE), by.to(DEVICE)
             optimizer.zero_grad()
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
+            criterion(model(bx), by).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            train_loss += loss.item()
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-
-        train_loss /= len(train_loader)
-
         model.eval()
-        val_loss = 0
-
-        pbar = tqdm(val_loader, desc=f"    Validation", leave=False, ncols=100)
-
         with torch.no_grad():
-            for batch_x, batch_y in pbar:
-                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-                outputs = model(batch_x)
-                loss = criterion(outputs, batch_y)
-                val_loss += loss.item()
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            val_loss = nn.BCEWithLogitsLoss()(model(X_val_t), y_val_t).item()
 
-        val_loss /= len(val_loader)
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-
-        print(f"  Epoch {epoch+1}/{num_epochs} | Train: {train_loss:.4f} | Val: {val_loss:.4f}")
-
-        last_epoch = epoch
-        last_val_loss = val_loss
+        if epoch < 3:
+            warmup_sched.step()
+        else:
+            plateau_sched.step(val_loss)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            patience_counter = 0
-
-            with open(best_model_path, 'wb') as f:
-                pickle.dump({
-                    'model_state': model.state_dict(),
-                    'epoch': epoch,
-                    'val_loss': val_loss
-                }, f)
-            print(f"  ✓ Best model saved (val_loss: {val_loss:.4f})")
+            best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_ctr  = 0
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"\n  🛑 Early stopping at epoch {epoch+1}")
+            patience_ctr += 1
+            if patience_ctr >= 8:
                 break
 
-        if (epoch + 1) % 10 == 0:
-            gc.collect()
-            if device == 'cuda':
-                torch.cuda.empty_cache()
-
-    # Load best model
-    if best_model_path.exists():
-        with open(best_model_path, 'rb') as f:
-            best_checkpoint = pickle.load(f)
-        model.load_state_dict(best_checkpoint['model_state'])
-        print(f"  ✓ Loaded best model from epoch {best_checkpoint['epoch']+1}")
-
-    # Save final model (best weights, but marked as final/complete)
-    with open(final_model_path, 'wb') as f:
-        pickle.dump({
-            'model_state': model.state_dict(),
-            'epoch': last_epoch,
-            'val_loss': last_val_loss
-        }, f)
-    print(f"  ✓ Final model saved: {final_model_path.name}")
-
-    return history
-
-
-# ============================
-# Evaluation
-# ============================
-
-def evaluate_model(model, val_loader, device):
-    """Evaluate model and return metrics including probs and labels for ROC curves."""
+    if best_state is not None:
+        model.load_state_dict(best_state)
     model.eval()
-    all_probs = []
-    all_labels = []
-
     with torch.no_grad():
-        for batch_x, batch_y in val_loader:
-            batch_x = batch_x.to(device)
-            outputs = model(batch_x)
-            probs = torch.sigmoid(outputs).cpu().numpy().flatten()
-            labels = batch_y.numpy().flatten()
-
-            all_probs.extend(probs)
-            all_labels.extend(labels)
-
-    print(f"  Total samples: {len(all_labels)}")
-    print(f"  Positive samples: {sum(all_labels)} ({sum(all_labels)/len(all_labels)*100:.1f}%)")
-
-    if len(set(all_labels)) < 2:
-        print(f"  ⚠ WARNING: Only one class present!")
-        return {
-            'auc': 0.0, 'accuracy': 0.0,
-            'sensitivity': 0.0, 'specificity': 0.0, 'f1': 0.0,
-            'probs': np.array(all_probs), 'labels': np.array(all_labels)
-        }
-
-    preds = (np.array(all_probs) > 0.5).astype(int)
-    tn, fp, fn, tp = confusion_matrix(all_labels, preds).ravel()
-
-    print(f"  Confusion: TP={tp}, FP={fp}, FN={fn}, TN={tn}")
-
-    return {
-        'accuracy': accuracy_score(all_labels, preds),
-        'sensitivity': tp / (tp + fn) if (tp + fn) > 0 else 0,
-        'specificity': tn / (tn + fp) if (tn + fp) > 0 else 0,
-        'auc': roc_auc_score(all_labels, all_probs),
-        'f1': f1_score(all_labels, preds),
-        'probs': np.array(all_probs),
-        'labels': np.array(all_labels)
-    }
+        return torch.sigmoid(model(X_val_t)).cpu().numpy().flatten()
 
 
-def plot_roc_curves(results, save_path=None):
-    """Plot ROC curves for all three models."""
+# ============================================================
+# LOO loop — leave one subject out
+# ============================================================
 
-    plt.figure(figsize=(10, 8))
+LOO_PROGRESS_CACHE = str(Path(CHECKPOINT_DIR) / 'guinea_loo_progress.pkl')
 
-    for model_name, color in [('diru', 'blue'), ('tractable', 'green'), ('lstm', 'red')]:
-        metrics = results[model_name]
-        fpr, tpr, _ = roc_curve(metrics['labels'], metrics['probs'])
-        auc = metrics['auc']
-        plt.plot(fpr, tpr, color=color, lw=2,
-                label=f'{model_name.upper()} (AUC = {auc:.3f})')
+def run_loo(recordings):
+    """
+    Leave-one-subject-out CV with fold-level checkpointing.
+    If interrupted, re-running resumes from the last completed fold.
+    Delete LOO_PROGRESS_CACHE to start fresh.
+    """
+    n = len(recordings)
 
-    plt.plot([0, 1], [0, 1], 'k--', lw=1, label='Random (AUC = 0.500)')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
+    # Load existing progress if available
+    progress_path = Path(LOO_PROGRESS_CACHE)
+    if progress_path.exists():
+        saved = pickle.load(open(progress_path, 'rb'))
+        all_probs   = saved['all_probs']
+        all_labels  = saved['all_labels']
+        start_fold  = saved['next_fold']
+        print(f"Resuming LOO from fold {start_fold}/{n} "
+              f"({start_fold} folds already done)")
+    else:
+        all_probs   = {name: [] for name in ('diru', 'tractable', 'lstm')}
+        all_labels  = {name: [] for name in ('diru', 'tractable', 'lstm')}
+        start_fold  = 0
+
+    for fold_i in tqdm(range(start_fold, n), desc="LOO folds",
+                       initial=start_fold, total=n):
+        test_rec   = recordings[fold_i]
+        train_recs = [recordings[j] for j in range(n) if j != fold_i]
+
+        X_tr = np.concatenate([r['X'] for r in train_recs], axis=0)
+        y_tr = np.concatenate([r['y'] for r in train_recs], axis=0)
+        X_te = test_rec['X']
+        y_te = test_rec['y']
+
+        # z-score: fit on train, apply to test
+        flat   = X_tr.reshape(-1, FULL_INPUT_SIZE)
+        mu     = flat.mean(axis=0, keepdims=True)
+        std    = flat.std( axis=0, keepdims=True)
+        X_tr_n = (X_tr - mu[None]) / (std[None] + 1e-8)
+        X_te_n = (X_te - mu[None]) / (std[None] + 1e-8)
+
+        models = make_models()
+        for name, model in models.items():
+            probs = train_fold(model, X_tr_n, y_tr, X_te_n, y_te)
+            all_probs[name].extend(probs.tolist())
+            all_labels[name].extend(y_te.tolist())
+        del models
+
+        # Save progress after every completed fold
+        pickle.dump({
+            'all_probs':  all_probs,
+            'all_labels': all_labels,
+            'next_fold':  fold_i + 1,
+        }, open(progress_path, 'wb'))
+
+        gc.collect()
+        if DEVICE == 'cuda':
+            torch.cuda.empty_cache()
+
+    # All folds done — remove progress file
+    if progress_path.exists():
+        progress_path.unlink()
+        print("LOO complete — progress cache cleared")
+
+    return all_probs, all_labels
+
+
+# ============================================================
+# Evaluation & plotting
+# ============================================================
+
+def evaluate(all_probs, all_labels):
+    print(f"\n{'='*60}\nLOO-CV SUMMARY  (Control=0  Epilepsy=1)\n{'='*60}")
+    summary = {}
+    for name in ('diru', 'tractable', 'lstm'):
+        probs  = np.array(all_probs[name])
+        labels = np.array(all_labels[name])
+
+        # Optimal threshold maximising F1
+        best_f1, best_thr = 0., 0.5
+        for thr in np.linspace(0.05, 0.95, 181):
+            p  = (probs > thr).astype(int)
+            tp = int(((p==1)&(labels==1)).sum())
+            fp = int(((p==1)&(labels==0)).sum())
+            fn = int(((p==0)&(labels==1)).sum())
+            f1 = 2*tp/(2*tp+fp+fn) if (2*tp+fp+fn) else 0.
+            if f1 > best_f1:
+                best_f1, best_thr = f1, thr
+
+        preds = (probs > best_thr).astype(int)
+        tn, fp, fn, tp = confusion_matrix(labels, preds).ravel()
+        sens = tp/(tp+fn) if (tp+fn) else 0.
+        spec = tn/(tn+fp) if (tn+fp) else 0.
+        auc  = roc_auc_score(labels, probs)
+        f1   = 2*tp/(2*tp+fp+fn) if (2*tp+fp+fn) else 0.
+        acc  = accuracy_score(labels, preds)
+
+        summary[name] = dict(sens=sens, spec=spec, auc=auc, f1=f1, acc=acc,
+                             probs=probs, labels=labels, threshold=best_thr)
+        print(f"  {name.upper():12s}  Sens={sens:.3f}  Spec={spec:.3f}  "
+              f"AUC={auc:.3f}  F1={f1:.3f}  Acc={acc:.3f}  thr={best_thr:.2f}")
+
+    d_auc = summary['diru']['auc']
+    l_auc = summary['lstm']['auc']
+    print(f"\n  DIRU vs LSTM  ΔAUC = {(d_auc-l_auc)*100:+.1f} pp")
+    return summary
+
+
+def plot_roc(summary, save_path=None):
+    plt.figure(figsize=(8, 7))
+    styles = {'diru':      ('royalblue', '-'),
+              'tractable': ('seagreen',  '--'),
+              'lstm':      ('firebrick', ':')}
+    for name, (col, ls) in styles.items():
+        m = summary[name]
+        fpr, tpr, _ = roc_curve(m['labels'], m['probs'])
+        plt.plot(fpr, tpr, color=col, ls=ls, lw=2,
+                 label=f"{name.upper()}  AUC={m['auc']:.3f}  Sens={m['sens']:.3f}")
+    plt.plot([0,1],[0,1],'k--',lw=1,label='Chance')
     plt.xlabel('False Positive Rate', fontsize=12)
-    plt.ylabel('True Positive Rate', fontsize=12)
-    plt.title('ROC Curves - Neonatal Seizure Detection', fontsize=14)
-    plt.legend(loc="lower right", fontsize=11)
+    plt.ylabel('True Positive Rate',  fontsize=12)
+    plt.title('LOO-CV ROC — Control vs Epileptic (Guinea-Bissau EEG)', fontsize=13)
+    plt.legend(fontsize=11)
     plt.grid(alpha=0.3)
-
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"\n✓ ROC curve saved: {save_path}")
-
+        print(f"ROC saved: {save_path}")
     plt.show()
 
 
-# ============================
+# ============================================================
 # Main
-# ============================
+# ============================================================
 
-def run_subband_comparison(data_path, num_epochs=20, batch_size=32, clean_checkpoints=False):
-    """Run 3-way comparison with subband decomposition."""
+def run(dataset_dir=DATASET_DIR, clear_cache=False):
+    if clear_cache:
+        p = Path(FEATURE_CACHE)
+        if p.exists():
+            p.unlink()
+            print("Feature cache cleared")
 
-    if clean_checkpoints:
-        print("\n🧹 Cleaning old checkpoints...")
-        checkpoint_files = [
-            'diru_best.pkl', 'tractable_best.pkl', 'lstm_best.pkl',
-            'diru_final.pkl', 'tractable_final.pkl', 'lstm_final.pkl',
-        ]
-        for ckpt_name in checkpoint_files:
-            ckpt_path = Path(CHECKPOINT_DIR) / ckpt_name
-            if ckpt_path.exists():
-                ckpt_path.unlink()
-                print(f"  Deleted: {ckpt_name}")
-        print("✓ Cleanup complete\n")
+    recordings = build_all_features(dataset_dir)
 
-    annotations_path = Path(data_path) / "annotations_2017_A_fixed.csv"
+    models_ex = make_models()
+    for name, m in models_ex.items():
+        print(f"  {name:12s}: {sum(p.numel() for p in m.parameters()):,} params")
+    del models_ex
 
-    print("\n" + "="*80)
-    print("HELSINKI NEONATAL EEG - SUBBAND DECOMPOSITION")
-    print("Raw Time Series decomposed into 5 frequency bands")
-    print("21 channels × 5 bands = 105 input channels → RNN")
-    print("Each DIRU compartment specializes to one frequency band!")
-    print("="*80)
+    n_ctrl = sum(1 for r in recordings if r['subject_label'] == 0)
+    n_epi  = sum(1 for r in recordings if r['subject_label'] == 1)
+    print(f"\nSubjects: {len(recordings)}  ({n_ctrl} control, {n_epi} epilepsy)")
+    print(f"Windows per subject: ~{int(np.mean([len(r['y']) for r in recordings]))}")
 
-    train_dataset = HelsinkiSubbandDataset(
-        data_path, annotations_path,
-        window_size=WINDOW_SIZE, overlap=OVERLAP,
-        fold='train', first_n_timepoints=FIRST_N_TIMEPOINTS,
-        max_files=MAX_FILES_PER_FOLD
-    )
+    all_probs, all_labels = run_loo(recordings)
+    summary = evaluate(all_probs, all_labels)
 
-    val_dataset = HelsinkiSubbandDataset(
-        data_path, annotations_path,
-        window_size=WINDOW_SIZE, overlap=OVERLAP,
-        fold='val', first_n_timepoints=FIRST_N_TIMEPOINTS,
-        max_files=MAX_FILES_PER_FOLD
-    )
+    rpath = Path(CHECKPOINT_DIR) / 'guinea_loo_results_v1.pkl'
+    pickle.dump({'probs': all_probs, 'labels': all_labels, 'summary': summary},
+                open(rpath, 'wb'))
+    print(f"Results saved: {rpath}")
 
-    if len(train_dataset) == 0 or len(val_dataset) == 0:
-        print("ERROR: No data loaded!")
-        return None
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-
-    sample_x, _ = next(iter(train_loader))
-    num_channels = sample_x.shape[2]
-    print(f"\nInput shape: {sample_x.shape}")
-    print(f"Channels: {num_channels} ({21} electrodes × {len(FREQUENCY_BANDS)} bands)")
-
-    seizure_count = sum(1 for w in train_dataset.window_index if w['label'] == 1)
-    pos_ratio = seizure_count / len(train_dataset)
-    pos_weight = torch.FloatTensor([(1 - pos_ratio) / pos_ratio]).to(DEVICE)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    print(f"Seizure ratio: {pos_ratio*100:.1f}%, pos_weight: {pos_weight.item():.2f}")
-
-    print(f"\nInitializing models (input={num_channels}, hidden={HIDDEN_SIZE})...")
-    diru = DIRU(num_channels, DIRU_HIDDEN_SIZE, 1, DIRU_NUM_COMPARTMENTS, dropout=DIRU_DROPOUT).to(DEVICE)
-    tractable = TractableDendriticRNN(num_channels, HIDDEN_SIZE, 1, NUM_COMPARTMENTS).to(DEVICE)
-    lstm = LSTMModel(num_channels, HIDDEN_SIZE, 1).to(DEVICE)
-
-    print(f"  DIRU:      {sum(p.numel() for p in diru.parameters()):,} params")
-    print(f"  Tractable: {sum(p.numel() for p in tractable.parameters()):,} params")
-    print(f"  LSTM:      {sum(p.numel() for p in lstm.parameters()):,} params")
-
-    print("\n" + "-"*80)
-    print("Training DIRU...")
-    print("-"*80)
-    diru_hist = train_model(diru, train_loader, val_loader, criterion, num_epochs, DEVICE,
-                           model_name='diru', checkpoint_dir=CHECKPOINT_DIR)
-
-    print("\n" + "-"*80)
-    print("Training Tractable...")
-    print("-"*80)
-    tractable_hist = train_model(tractable, train_loader, val_loader, criterion, num_epochs, DEVICE,
-                                 model_name='tractable', checkpoint_dir=CHECKPOINT_DIR)
-
-    print("\n" + "-"*80)
-    print("Training LSTM...")
-    print("-"*80)
-    lstm_hist = train_model(lstm, train_loader, val_loader, criterion, num_epochs, DEVICE,
-                           model_name='lstm', checkpoint_dir=CHECKPOINT_DIR)
-
-    print("\n" + "="*80)
-    print("RESULTS")
-    print("="*80)
-
-    print("\nEvaluating DIRU:")
-    diru_metrics = evaluate_model(diru, val_loader, DEVICE)
-
-    print("\nEvaluating Tractable:")
-    tractable_metrics = evaluate_model(tractable, val_loader, DEVICE)
-
-    print("\nEvaluating LSTM:")
-    lstm_metrics = evaluate_model(lstm, val_loader, DEVICE)
-
-    print("\n" + "="*80)
-    print("SUMMARY")
-    print("="*80)
-    print(f"DIRU:      Sens: {diru_metrics['sensitivity']:.2%} | AUC: {diru_metrics['auc']:.3f}")
-    print(f"Tractable: Sens: {tractable_metrics['sensitivity']:.2%} | AUC: {tractable_metrics['auc']:.3f}")
-    print(f"LSTM:      Sens: {lstm_metrics['sensitivity']:.2%} | AUC: {lstm_metrics['auc']:.3f}")
-
-    improvement = (diru_metrics['sensitivity'] - lstm_metrics['sensitivity']) * 100
-    print(f"\nDIRU vs LSTM: {improvement:+.1f} percentage points")
-
-    print("\n🧠 Interpretation:")
-    print("Each DIRU compartment specializes to one frequency band:")
-    print("  Comp 1 → Delta channels  (0.5-4 Hz):  Slow-wave seizures")
-    print("  Comp 2 → Theta channels  (4-8 Hz):    Baseline disruption")
-    print("  Comp 3 → Alpha channels  (8-13 Hz):   Arousal changes")
-    print("  Comp 4 → Beta channels   (13-30 Hz):  Ictal discharges")
-    print("  Comp 5 → Gamma channels  (30-50 Hz):  High-frequency markers")
-
-    results = {
-        'diru': diru_metrics,
-        'tractable': tractable_metrics,
-        'lstm': lstm_metrics,
-        'improvement': improvement
-    }
-
-    results_path = Path(CHECKPOINT_DIR) / 'subband_results.pkl'
-    with open(results_path, 'wb') as f:
-        pickle.dump(results, f)
-    print(f"\n✓ Results saved: {results_path}")
-
-    print("\n" + "="*80)
-    print("ROC CURVES")
-    print("="*80)
-    roc_path = Path(CHECKPOINT_DIR) / 'roc_curves.png'
-    plot_roc_curves(results, save_path=roc_path)
-
-    return results
+    plot_roc(summary, save_path=Path(CHECKPOINT_DIR) / 'roc_guinea_v1.png')
+    return summary
 
 
 if __name__ == "__main__":
-    DATA_PATH = "/content/drive/MyDrive/eeg_cache"
-
-    # Set to True to delete old checkpoints and start fresh
-    CLEAN_CHECKPOINTS = False
-
-    results = run_subband_comparison(
-        DATA_PATH,
-        num_epochs=NUM_EPOCHS,
-        batch_size=BATCH_SIZE,
-        clean_checkpoints=CLEAN_CHECKPOINTS
-    )
-
-    if results:
-        print("\n" + "="*80)
-        print("COMPLETED!")
-        print("="*80)
-        
-        
-        
-        
-        
-        
-        
-import pickle
+    CLEAR_CACHE = False
+    summary = run(clear_cache=CLEAR_CACHE)
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from scipy.signal import butter, filtfilt, resample
+from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve, accuracy_score
+import matplotlib.pyplot as plt
 from pathlib import Path
+import pyedflib
+import gc
+import pickle
+from tqdm import tqdm
+from collections import defaultdict
 
-CHECKPOINT_DIR= '/content/drive/MyDrive/checkpoints'
+# ============================================================
+# Config
+# ============================================================
+DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
+NUM_EPOCHS = 40
+BATCH_SIZE = 32
+HIDDEN_SIZE     = 32
+DIRU_DROPOUT    = 0.5
+N_COMPARTMENTS  = 4
 
-# Load saved results
-results_path = Path(CHECKPOINT_DIR) / 'subband_results.pkl'
-with open(results_path, 'rb') as f:
-    results = pickle.load(f)
+WINDOW_SIZE        = 3
+OVERLAP            = 0.75
+FIRST_N_TIMEPOINTS = 15417
+FRAME_LEN_SEC      = 0.5
+FRAME_STEP_SEC     = 0.25
 
-# Print full report for each model
-for model_name in ['diru', 'tractable', 'lstm']:
-    metrics = results[model_name]
-    print(f"\n{model_name.upper()} Metrics:")
-    print(f"  Accuracy:    {metrics['accuracy']:.4f}")
-    print(f"  Sensitivity: {metrics['sensitivity']:.4f}")  # same as recall
-    print(f"  Specificity: {metrics['specificity']:.4f}")
-    print(f"  F1 Score:    {metrics['f1']:.4f}")
-    print(f"  AUC:         {metrics['auc']:.4f}")
+#SELECTED_CHANNELS = [2, 3, 4, 5, 12, 13, 8, 9]
+SELECTED_CHANNELS = [1, 2, 3, 4, 11, 12, 7, 8]   # 8 channels, matching original selection minus CZ
+
+N_CHANNELS        = len(SELECTED_CHANNELS)   # 8
+
+SUBBANDS = [
+    ("delta", 0.5,  4.0),
+    ("theta", 4.0,  8.0),
+    ("alpha", 8.0,  13.0),
+    ("beta",  13.0, 30.0),
+    ("gamma", 30.0, 50.0),
+]
+N_BANDS         = len(SUBBANDS)
+FULL_INPUT_SIZE = N_BANDS * N_CHANNELS   # 40
+
+CHECKPOINT_DIR = "/content/drive/MyDrive/checkpoints"
+FEATURE_CACHE  = "/content/drive/MyDrive/checkpoints/loo_features_v6.pkl"
+
+_FS       = 256
+_FL       = int(FRAME_LEN_SEC  * _FS)
+_FS_STEP  = int(FRAME_STEP_SEC * _FS)
+_WIN_SAMP = int(WINDOW_SIZE    * _FS)
+T_SEQ     = 1 + (_WIN_SAMP - _FL) // _FS_STEP   # 11
+
+print(f"Device={DEVICE}  T_seq={T_SEQ}  features={FULL_INPUT_SIZE}")
+print(f"hidden={HIDDEN_SIZE} (all models)  epochs={NUM_EPOCHS}  batch={BATCH_SIZE}")
+Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# Signal processing
+# ============================================================
+# ============================
+# Bipolar montage
+# ============================
+def bipolar_montage(data):
+    """
+    Convert monopolar EEG to bipolar montage.
+    Input:  (channels, samples) → e.g. (21, T)
+    Output: (channels-1, samples) → e.g. (20, T)
+    """
+    return data[1:, :] - data[:-1, :]
+
+
+def _bp(data, lo, hi, fs, order=4):
+    nyq = fs / 2.0
+    b, a = butter(order, [max(lo/nyq, 1e-4), min(hi/nyq, 1-1e-4)], btype='band')
+    return filtfilt(b, a, data, axis=1)
+
+
+def compute_band_power_sequence(data, fs=_FS):
+    """(n_ch, n_samp) -> (T_seq, 40)  log band-power, unnormalised."""
+    n_ch, n_samp = data.shape
+    starts   = np.arange(0, n_samp - _FL + 1, _FS_STEP)
+    n_frames = len(starts)
+    power    = np.zeros((N_BANDS, n_ch, n_frames), dtype=np.float32)
+
+    for b_i, (_, lo, hi) in enumerate(SUBBANDS):
+        band = _bp(data, lo, hi, fs)
+        for f_i, s in enumerate(starts):
+            power[b_i, :, f_i] = np.mean(band[:, s:s+_FL] ** 2, axis=1)
+
+    power = np.log1p(power)
+    power = power.transpose(2, 0, 1)           # (T, B, C)
+    return power.reshape(n_frames, N_BANDS * n_ch).astype(np.float32)
+
+
+def load_recording(file_path):
+    """Load EDF -> (8, n_samples) preprocessed signal."""
+    try:
+        edf   = pyedflib.EdfReader(str(file_path))
+        sfreq = edf.getSampleFrequency(0)
+        data  = np.array([edf.readSignal(i) for i in range(edf.signals_in_file)])
+        edf.close()
+    except Exception as e:
+        print(f"  ERROR loading {Path(file_path).name}: {e}")
+        return None
+    try:
+        if sfreq != _FS:
+            data = resample(data, int(data.shape[1] * _FS / sfreq), axis=1)
+        b, a     = butter(4, [0.5, 50], fs=_FS, btype='band')
+        data     = filtfilt(b, a, data, axis=1)
+        #b_n, a_n = butter(4, [49, 51], fs=_FS, btype='bandstop')
+        #data     = filtfilt(b_n, a_n, data, axis=1)
+
+        data = bipolar_montage(data)    
+
+        #data    -= data.mean(axis=0, keepdims=True)                     # CAR
+        data     = (data - data.mean(axis=1, keepdims=True)) / \
+                   (data.std(axis=1, keepdims=True) + 1e-8)             # per-ch z-score
+        data     = data[:, :FIRST_N_TIMEPOINTS]
+        data     = data[SELECTED_CHANNELS, :]
+    except Exception as e:
+        print(f"  ERROR preprocessing {Path(file_path).name}: {e}")
+        return None
+    return data
+
+
+# ============================================================
+# Pre-compute all features once
+# ============================================================
+
+def build_all_features(data_path, annotations_path):
+    """
+    Returns list of dicts, one per valid recording:
+      { 'rec_idx', 'file', 'X': (n_win, T_seq, 40), 'y': (n_win,) }
+    Raw log-power — z-score applied per LOO fold, not here.
+    Cached to disk so second run is instant.
+    """
+    cache = Path(FEATURE_CACHE)
+    if cache.exists():
+        print(f"Loading cached features: {cache}")
+        recs = pickle.load(open(cache, 'rb'))
+        print(f"  {len(recs)} recordings loaded")
+        return recs
+
+    ann_df    = pd.read_csv(annotations_path, header=None)
+    edf_files = sorted(Path(data_path).glob("eeg*.edf"),
+                       key=lambda x: int(''.join(filter(str.isdigit, x.stem))))[:79]
+
+    win_samp  = _WIN_SAMP
+    step_samp = max(1, int(win_samp * (1 - OVERLAP)))
+    recs      = []
+
+    for edf_file in tqdm(edf_files, desc="Pre-computing features (runs once)"):
+        rec_num = int(''.join(filter(str.isdigit, edf_file.stem)))
+        col_idx = rec_num - 1
+        if col_idx >= ann_df.shape[1]:
+            continue
+
+        data = load_recording(edf_file)
+        if data is None:
+            continue
+
+        annot  = ann_df[col_idx].values[:FIRST_N_TIMEPOINTS]
+        X_list, y_list = [], []
+
+        for start in range(0, len(annot) - win_samp, step_samp):
+            end    = start + win_samp
+            ratio  = float(annot[start:end].sum()) / win_samp
+            window = data[:, start:end]
+            if window.shape[1] < win_samp:
+                window = np.concatenate(
+                    [window, np.zeros((window.shape[0], win_samp - window.shape[1]))],
+                    axis=1)
+            ps = compute_band_power_sequence(window)
+            ps = ps[:T_SEQ] if ps.shape[0] >= T_SEQ else \
+                 np.vstack([ps, np.zeros((T_SEQ - ps.shape[0], FULL_INPUT_SIZE))])
+            X_list.append(ps)
+            y_list.append(float(ratio > 0.1))
+
+        if not X_list:
+            continue
+
+        recs.append({
+            'rec_idx': col_idx,
+            'file':    edf_file.name,
+            'X':       np.stack(X_list).astype(np.float32),
+            'y':       np.array(y_list, dtype=np.float32),
+        })
+
+    print(f"Done: {len(recs)} recordings extracted")
+    pickle.dump(recs, open(cache, 'wb'))
+    print(f"Cached to: {cache}")
+    return recs
+
+
+# ============================================================
+# Models — all take (B, T_seq, 40), same hidden_size=32
+# ============================================================
+
+class DIRUCell(nn.Module):
+    """
+    K compartments, each with its own W_in over the FULL input (40 features).
+    Inductive bias: K separate learned projections, not input restriction.
+    """
+    def __init__(self, input_size, hidden_size, num_compartments):
+        super().__init__()
+        self.num_comp = num_compartments
+        self.W_in  = nn.ModuleList([
+            nn.Linear(input_size, hidden_size) for _ in range(num_compartments)
+        ])
+        self.W_rec = nn.Linear(hidden_size, hidden_size * num_compartments)
+        # gate outputs K scalars (one attention weight per compartment)
+        self.gate  = nn.Linear(hidden_size * num_compartments, num_compartments)
+
+
+    def forward(self, x, h):
+        rec   = self.W_rec(h).chunk(self.num_comp, dim=1)
+        outs  = [torch.tanh(self.W_in[i](x) + rec[i]) for i in range(self.num_comp)]
+        stack = torch.stack(outs, dim=1)                        # (B, K, H)
+        # gate: K attention weights via softmax — output magnitude preserved
+        w = torch.softmax(self.gate(stack.reshape(stack.size(0), -1)), dim=1)  # (B, K)
+        return (stack * w.unsqueeze(2)).sum(dim=1)              # (B, H)
+
+
+class DIRU(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size,
+                 num_compartments=N_COMPARTMENTS, dropout=DIRU_DROPOUT):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.cell        = DIRUCell(input_size, hidden_size, num_compartments)
+        self.dropout     = nn.Dropout(dropout)
+        self.fc          = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        h = torch.zeros(B, self.hidden_size, device=x.device)
+        for t in range(T):
+            h = self.cell(x[:, t], h)
+        return self.fc(self.dropout(h))
+
+
+class TractableDendriticCell(nn.Module):
+    def __init__(self, input_size, hidden_size, num_compartments):
+        super().__init__()
+        self.num_comp  = num_compartments
+        self.comp_size = hidden_size // num_compartments
+        assert hidden_size % num_compartments == 0
+        self.W_in  = nn.ModuleList([
+            nn.Linear(input_size,  self.comp_size) for _ in range(num_compartments)
+        ])
+        self.W_rec = nn.ModuleList([
+            nn.Linear(hidden_size, self.comp_size) for _ in range(num_compartments)
+        ])
+        self.integration = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, x, h):
+        outs = [torch.tanh(self.W_in[i](x) + self.W_rec[i](h))
+                for i in range(self.num_comp)]
+        return torch.tanh(self.integration(torch.cat(outs, dim=1)))
+
+
+class TractableDendriticRNN(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size,
+                 num_compartments=N_COMPARTMENTS):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.cell        = TractableDendriticCell(input_size, hidden_size, num_compartments)
+        self.dropout     = nn.Dropout(0.5)
+        self.fc          = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        h = torch.zeros(B, self.hidden_size, device=x.device)
+        for t in range(T):
+            h = self.cell(x[:, t], h)
+        return self.fc(self.dropout(h))
+
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1):
+        super().__init__()
+        self.lstm    = nn.LSTM(input_size, hidden_size, num_layers=num_layers,
+                               batch_first=True)
+        self.dropout = nn.Dropout(0.5)
+        self.fc      = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(self.dropout(out[:, -1]))
+
+
+def make_models():
+    return {
+        'diru':      DIRU(FULL_INPUT_SIZE, HIDDEN_SIZE, 1).to(DEVICE),
+        'tractable': TractableDendriticRNN(FULL_INPUT_SIZE, HIDDEN_SIZE, 1).to(DEVICE),
+        'lstm':      LSTMModel(FULL_INPUT_SIZE, HIDDEN_SIZE, 1).to(DEVICE),
+    }
+
+
+# ============================================================
+# Per-fold training
+# ============================================================
+
+def train_fold(model, X_tr, y_tr, X_val, y_val):
+    """
+    Train on (X_tr, y_tr), evaluate on (X_val, y_val).
+    No checkpointing — each fold trains from scratch and is fast.
+    Returns: probs array for X_val.
+    """
+    tr_ds     = TensorDataset(torch.FloatTensor(X_tr),
+                               torch.FloatTensor(y_tr).unsqueeze(1))
+    tr_loader = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True)
+
+    n_pos = int(y_tr.sum())
+    n_neg = len(y_tr) - n_pos
+    pw    = torch.FloatTensor([n_neg / max(n_pos, 1)]).to(DEVICE)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
+
+    optimizer     = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    warmup_epochs = 3
+    warmup_sched  = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+    plateau_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=4, min_lr=1e-5)
+
+    best_val_loss = float('inf')
+    best_state    = None
+    patience_ctr  = 0
+    patience      = 8
+
+    X_val_t = torch.FloatTensor(X_val).to(DEVICE)
+    y_val_t = torch.FloatTensor(y_val).unsqueeze(1).to(DEVICE)
+
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        ep_loss = 0.0
+        for bx, by in tr_loader:
+            bx, by = bx.to(DEVICE), by.to(DEVICE)
+            optimizer.zero_grad()
+            loss = criterion(model(bx), by)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            ep_loss += loss.item()
+        ep_loss /= len(tr_loader)
+
+        model.eval()
+        with torch.no_grad():
+            val_loss = nn.BCEWithLogitsLoss()(model(X_val_t), y_val_t).item()
+
+        if epoch < warmup_epochs:
+            warmup_sched.step()
+        else:
+            plateau_sched.step(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_ctr  = 0
+        else:
+            patience_ctr += 1
+            if patience_ctr >= patience:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        probs = torch.sigmoid(model(X_val_t)).cpu().numpy().flatten()
+    return probs
+
+
+# ============================================================
+# LOO loop
+# ============================================================
+
+def run_loo(recordings):
+    """
+    Leave-one-recording-out CV.
+    For each fold i: train on 75 recordings, test on 1.
+    z-score fitted on train windows only, applied to test.
+    ALL predictions aggregated — including recordings with only one class.
+    AUC is only meaningful on the pooled set (both classes present overall).
+    """
+    n           = len(recordings)
+    all_probs   = {name: [] for name in ('diru', 'tractable', 'lstm')}
+    all_labels  = {name: [] for name in ('diru', 'tractable', 'lstm')}
+    single_class_folds = 0
+
+    for fold_i in tqdm(range(n), desc="LOO folds"):
+        test_rec   = recordings[fold_i]
+        train_recs = [recordings[j] for j in range(n) if j != fold_i]
+
+        X_tr = np.concatenate([r['X'] for r in train_recs], axis=0)
+        y_tr = np.concatenate([r['y'] for r in train_recs], axis=0)
+        X_te = test_rec['X']
+        y_te = test_rec['y']
+
+        if len(np.unique(y_te)) < 2:
+            single_class_folds += 1
+            # Still include predictions — they contribute TN/TP to pooled eval
+
+        # z-score: fit on train, apply to test — no leakage
+        flat   = X_tr.reshape(-1, FULL_INPUT_SIZE)
+        mu     = flat.mean(axis=0, keepdims=True)
+        std    = flat.std( axis=0, keepdims=True)
+        X_tr_n = (X_tr - mu[None]) / (std[None] + 1e-8)
+        X_te_n = (X_te - mu[None]) / (std[None] + 1e-8)
+
+        models = make_models()
+        for name, model in models.items():
+            probs = train_fold(model, X_tr_n, y_tr, X_te_n, y_te)
+            all_probs[name].extend(probs.tolist())
+            all_labels[name].extend(y_te.tolist())
+
+        del models
+        gc.collect()
+        if DEVICE == 'cuda':
+            torch.cuda.empty_cache()
+
+    print(f"  {single_class_folds} folds had single-class test recordings "
+          f"(predictions included in pooled eval)")
+    return all_probs, all_labels
+
+
+# ============================================================
+# Evaluation & plotting
+# ============================================================
+
+def evaluate(all_probs, all_labels):
+    print(f"\n{'='*60}\nLOO-CV SUMMARY\n{'='*60}")
+    summary = {}
+    for name in ('diru', 'tractable', 'lstm'):
+        probs  = np.array(all_probs[name])
+        labels = np.array(all_labels[name])
+
+        # Find threshold maximising F1 over all LOO predictions
+        thresholds = np.linspace(0.05, 0.95, 181)
+        best_f1, best_thr = 0., 0.5
+        for thr in thresholds:
+            preds_t = (probs > thr).astype(int)
+            tp = int(((preds_t == 1) & (labels == 1)).sum())
+            fp = int(((preds_t == 1) & (labels == 0)).sum())
+            fn = int(((preds_t == 0) & (labels == 1)).sum())
+            f1_t = 2*tp / (2*tp + fp + fn) if (2*tp + fp + fn) else 0.
+            if f1_t > best_f1:
+                best_f1, best_thr = f1_t, thr
+
+        preds = (probs > best_thr).astype(int)
+        tn, fp, fn, tp = confusion_matrix(labels, preds).ravel()
+        sens = tp / (tp + fn) if (tp + fn) else 0.
+        spec = tn / (tn + fp) if (tn + fp) else 0.
+        auc  = roc_auc_score(labels, probs)
+        f1   = 2*tp / (2*tp + fp + fn) if (2*tp + fp + fn) else 0.
+        acc  = accuracy_score(labels, preds)
+        summary[name] = dict(sens=sens, spec=spec, auc=auc, f1=f1, acc=acc,
+                             probs=probs, labels=labels, threshold=best_thr)
+        print(f"  {name.upper():12s}  Sens={sens:.3f}  Spec={spec:.3f}  "
+              f"AUC={auc:.3f}  F1={f1:.3f}  Acc={acc:.3f}  thr={best_thr:.2f}")
+
+    d_auc = summary['diru']['auc']
+    l_auc = summary['lstm']['auc']
+    print(f"\n  DIRU vs LSTM  ΔAUC = {(d_auc - l_auc)*100:+.1f} pp")
+    return summary
+
+
+def plot_roc(summary, save_path=None):
+    plt.figure(figsize=(8, 7))
+    styles = {'diru':      ('royalblue', '-'),
+              'tractable': ('seagreen',  '--'),
+              'lstm':      ('firebrick', ':')}
+    for name, (col, ls) in styles.items():
+        m = summary[name]
+        fpr, tpr, _ = roc_curve(m['labels'], m['probs'])
+        plt.plot(fpr, tpr, color=col, ls=ls, lw=2,
+                 label=f"{name.upper()}  AUC={m['auc']:.3f}  Sens={m['sens']:.3f}")
+    plt.plot([0,1],[0,1],'k--',lw=1,label='Chance')
+    plt.xlabel('False Positive Rate', fontsize=12)
+    plt.ylabel('True Positive Rate',  fontsize=12)
+    plt.title('LOO-CV ROC — Neonatal Seizure (Band-Power v6)', fontsize=13)
+    plt.legend(fontsize=11)
+    plt.grid(alpha=0.3)
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"ROC saved: {save_path}")
+    plt.show()
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def run(data_path, clear_cache=False):
+    if clear_cache:
+        p = Path(FEATURE_CACHE)
+        if p.exists():
+            p.unlink()
+            print("Feature cache cleared")
+
+    ann_path   = Path(data_path) / "annotations_2017_A_fixed.csv"
+    recordings = build_all_features(data_path, ann_path)
+
+    # Print param counts
+    models_ex = make_models()
+    for name, m in models_ex.items():
+        n_params = sum(p.numel() for p in m.parameters())
+        print(f"  {name:12s}: {n_params:,} params")
+    del models_ex
+
+    print(f"\nStarting LOO over {len(recordings)} recordings ...")
+    all_probs, all_labels = run_loo(recordings)
+
+    summary = evaluate(all_probs, all_labels)
+
+    rpath = Path(CHECKPOINT_DIR) / 'loo_results_v6.pkl'
+    pickle.dump({'probs': all_probs, 'labels': all_labels, 'summary': summary},
+                open(rpath, 'wb'))
+    print(f"Results saved: {rpath}")
+
+    plot_roc(summary, save_path=Path(CHECKPOINT_DIR) / 'roc_loo_v6.png')
+    return summary
+
+
+if __name__ == "__main__":
+    DATA_PATH   = "/content/drive/MyDrive/eeg_cache"
+    CLEAR_CACHE = False   # set True to re-extract features after pipeline changes
+
+    summary = run(DATA_PATH, clear_cache=CLEAR_CACHE)
