@@ -1,7 +1,8 @@
 # Dendrite-Inspired Recurrent Units (DIRU)  
 
-
 This package contains a complete implementation of a novel RNN architecture inspired by dendritic computation in biological neurons, along with comprehensive comparisons to LSTM.
+
+![Alt text](visual.png)
 
 ### Core Files
 
@@ -132,73 +133,7 @@ model = DIRU(
 
 output = model(input_sequence)
 ```
-
-## 📈 Expected Results
-
-### Performance Summary
-
-```
-Multi-Frequency Sine Waves:
-  DIRU: 0.024 MSE
-  LSTM: 0.031 MSE
-  Improvement: +24.9%
-
-Variable-Delay Memory:
-  DIRU: 1.235 MSE
-  LSTM: 1.568 MSE
-  Improvement: +21.3%
-
-Chaotic Dynamics:
-  DIRU: 0.457 MSE
-  LSTM: 0.523 MSE
-  Improvement: +12.7%
-```
-
-### Training Time
-
-```
-Average Epoch Time (CPU):
-  DIRU: ~0.15s
-  LSTM: ~0.12s
-  Overhead: ~25%
-
-The extra computation is offset by faster convergence and better final performance.
-```
-
-## 🎓 Theoretical Highlights
-
-### Expressive Power
-- DIRU with k compartments ≈ k-layer standard RNN
-- Parallel computation reduces effective depth
-- Direct hierarchical feature learning
-
-### Gradient Flow
-- Multiple gradient paths through compartments
-- Gating prevents vanishing gradients
-- Residual connections aid long-range flow
-- Better than vanilla RNN, comparable to LSTM
-
-### Memory Capacity
-- Distributed storage across compartments
-- Each compartment can specialize
-- Reduced interference between patterns
-- ~k× capacity of standard RNN
-
-## 🔍 When to Use DIRU
-
-### ✅ Use DIRU For:
-- Multi-scale temporal patterns
-- Long-range dependencies
-- Complex nonlinear dynamics
-- Tasks requiring hierarchical representations
-- Medium-large datasets (500+ samples)
-
-### ❌ Stick with LSTM For:
-- Simple sequential tasks
-- Very small datasets (<200 samples)
-- Ultra-low latency requirements
-- Well-optimized existing LSTM pipelines
-
+   
 ## 💡 Key Insights
 
 ### 1. Biological Inspiration Works
@@ -265,41 +200,7 @@ The extra computation is offset by faster convergence and better final performan
 4. **Integration with Transformers**
    - Use DIRU as temporal encoder
    - Combine with attention mechanisms
-
-## 📚 File Descriptions
-
-### Implementation (dendrite_rnn.py)
-- **Lines 1-150**: DendriteCompartment and DIRUCell classes
-- **Lines 150-250**: DIRU network wrapper
-- **Lines 250-350**: LSTM baseline implementation
-- **Lines 350-600**: Three toy dataset classes
-- **Lines 600-700**: Training and evaluation utilities
-- **Lines 700-850**: Visualization functions
-- **Lines 850-1000**: Main experimental pipeline
-
-### Documentation (README.md)
-- Architecture overview
-- Core ideas and motivation
-- Theoretical analysis summary
-- Usage examples
-- Results and insights
-
-### Theory (theoretical_analysis.md)
-- Mathematical formulation
-- Formal proofs and arguments
-- Complexity analysis
-- Connections to related work
-- Future research directions
-
-### Guide (USAGE_GUIDE.md)
-- Step-by-step instructions
-- Expected outputs
-- Hyperparameter tuning
-- Troubleshooting
-- Performance optimization
-
-## 🎯 Next Steps
-
+  
 ### For Users
 1. Run quick_demo.py to verify installation
 2. Try DIRU on your time series data
@@ -342,31 +243,7 @@ We welcome contributions:
 - Performance optimizations
 - Documentation improvements
 - Theoretical insights
-
-## 📞 Support
-
-- Read the documentation first (README.md, theoretical_analysis.md)
-- Check USAGE_GUIDE.md for common issues
-- Review code comments for implementation details
-- Open GitHub issues for bugs or questions
-
-## 🌟 Highlights
-
-1. **Novel Architecture**: First implementation of dendritic RNN at scale
-2. **Strong Theory**: Formal analysis of expressive power and gradients
-3. **Empirical Validation**: Outperforms LSTM on hierarchical tasks
-4. **Complete Package**: Code, theory, experiments, documentation
-5. **Easy to Use**: Drop-in replacement for LSTM in PyTorch
-
-## 🎊 Conclusion
-
-DIRU demonstrates that biological inspiration can lead to practical ML improvements. By incorporating dendritic computation principles, we achieve:
-- Better performance on hierarchical temporal tasks
-- Improved gradient flow and memory capacity
-- A new perspective on RNN design
-
-This is a research prototype with significant potential. We encourage experimentation, validation, and extension!
-
+   
 ---
 
 **Version**: 1.0.0
