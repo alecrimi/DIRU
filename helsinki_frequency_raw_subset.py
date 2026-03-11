@@ -152,7 +152,7 @@ def build_all_features(data_path, annotations_path):
             ps = ps[:T_SEQ] if ps.shape[0] >= T_SEQ else \
                  np.vstack([ps, np.zeros((T_SEQ - ps.shape[0], FULL_INPUT_SIZE))])
             X_list.append(ps)
-            y_list.append(float(ratio > 0.1))
+            y_list.append(float(ratio > 0.5))
 
         if not X_list:
             continue
@@ -286,7 +286,10 @@ def train_fold(model, X_tr, y_tr, X_val, y_val):
 
     n_pos = int(y_tr.sum())
     n_neg = len(y_tr) - n_pos
-    pw    = torch.FloatTensor([n_neg / max(n_pos, 1)]).to(DEVICE)
+
+    SENSITIVITY_BOOST = 5   # tune this: 1.5, 2.0, 2.5, 3.0
+    pw = torch.FloatTensor([SENSITIVITY_BOOST * n_neg / max(n_pos, 1)]).to(DEVICE)
+
     criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
 
     optimizer     = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
