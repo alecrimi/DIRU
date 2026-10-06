@@ -22,7 +22,7 @@ This package contains a complete implementation of a novel RNN architecture insp
 ```bibtex
 @misc{diru2025,
   title={DIRU: Dendrite-Inspired Recurrent Units for Learning Chaotic Dynamics and Neonatal Epilepsy Time Series},
-  authors=Salvatore Vitabile Alessandro Crimi, Cris Micheli, Tiziana Currieri, Francesco Prinzi,
+  authors={Alessandro Crimi, Cris Micheli, Tiziana Currieri, Francesco Prinzi,Salvatore Vitabile },
   year={2026},
   Journal={Neural Computation and Application}
 }
