@@ -4,7 +4,7 @@ This package contains a complete implementation of a novel RNN architecture insp
 
 ![Alt text](visual.png)
 
-![Alt text](full_electrode.png)
+![Alt text](minimal_electrode.png)
 
  
 ## 🎯 Key Innovation
@@ -21,9 +21,10 @@ This package contains a complete implementation of a novel RNN architecture insp
 **Citation**: If you use this code, please cite:
 ```bibtex
 @misc{diru2025,
-  title={Dendrite-Inspired Recurrent Units: Biologically-Motivated RNN Architecture},
-  year={2025},
-  note={Novel RNN with dendritic compartment structure}
+  title={DIRU: Dendrite-Inspired Recurrent Units for Learning Chaotic Dynamics and Neonatal Epilepsy Time Series},
+  authors=Salvatore Vitabile Alessandro Crimi, Cris Micheli, Tiziana Currieri, Francesco Prinzi,
+  year={2026},
+  Journal={Neural Computation and Application}
 }
 ```
   
