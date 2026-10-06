@@ -4,7 +4,9 @@ This package contains a complete implementation of a novel RNN architecture insp
 
 ![Alt text](visual.png)
 
-![Alt text](minimal_electrodes.png)
+<p align="center">
+  <img src="minimal_electrodes.png" width="600">
+</p> 
 
  
 ## 🎯 Key Innovation
